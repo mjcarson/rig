@@ -172,30 +172,114 @@ impl From<AwsSdkInvokeModelError> for EmbeddingError {
 
 pub struct AwsSdkConverseError(pub SdkError<ConverseError, HttpResponse>);
 
-/// Attach the AWS request id (from the SDK error's response metadata) to a
-/// preserved provider response body — the id AWS support asks for on failed
-/// calls (rig#2314). Rig-authored `ProviderError` diagnostics are left
-/// untouched: the id belongs with what the provider actually said.
-fn attach_request_id(error: CompletionError, request_id: Option<String>) -> CompletionError {
+/// The HTTP status Bedrock answered with, when the failure carries a raw
+/// response.
+///
+/// `SdkError::into_service_error` discards the transport, so the status must
+/// be read off the raw response *before* the error is consumed. Preserving it
+/// lets a provider-agnostic retry layer classify throttles (429) and server
+/// faults (5xx) through `provider_response_status()` instead of matching on
+/// AWS-specific body text.
+fn raw_status<E>(error: &SdkError<E, HttpResponse>) -> Option<http::StatusCode> {
+    // smithy's status is a plain u16 wrapper; convert it into the http type
+    http::StatusCode::from_u16(error.raw_response()?.status().as_u16()).ok()
+}
+
+/// The HTTP headers Bedrock answered with, when the failure carries a raw
+/// response — the rate-limit metadata (`Retry-After`, `x-ratelimit-*`) a
+/// caller needs to back off correctly after a 429 (rig#2210).
+fn raw_headers<E>(error: &SdkError<E, HttpResponse>) -> Option<Box<http::HeaderMap>> {
+    // collect the smithy header pairs into a standard header map, skipping
+    // any name or value the http types reject
+    let headers = error
+        .raw_response()?
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = http::header::HeaderName::from_bytes(name.as_bytes()).ok()?;
+            let value = http::HeaderValue::from_str(value).ok()?;
+            Some((name, value))
+        })
+        .collect::<http::HeaderMap>();
+    // an empty map means nothing was captured, not an empty response
+    (!headers.is_empty()).then(|| Box::new(headers))
+}
+
+/// Surface a pure transport failure (a client-side timeout or connector I/O
+/// error) as a retryable [`CompletionError::HttpError`], handing every other
+/// failure back for service-error gating.
+///
+/// Without this, `into_service_error` folds timeouts into `Unhandled` and they
+/// surface as non-retryable `ProviderError` prose.
+fn transport_failure<E>(
+    error: SdkError<E, HttpResponse>,
+) -> Result<SdkError<E, HttpResponse>, CompletionError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    // a timeout never reached the service; a dispatch failure only counts as
+    // transport when the connector reports a timeout or I/O fault (anything
+    // else, e.g. a TLS misconfiguration, is not retryable)
+    let is_transport = matches!(&error, SdkError::TimeoutError(_))
+        || matches!(
+            &error,
+            SdkError::DispatchFailure(failure)
+                if failure.as_connector_error().is_some_and(|err| err.is_timeout() || err.is_io())
+        );
+    if is_transport {
+        // wrap the sdk error whole so its message survives verbatim
+        return Err(CompletionError::HttpError(
+            rig_core::http_client::Error::Instance(Box::new(error)),
+        ));
+    }
+    Ok(error)
+}
+
+/// Attach the transport metadata recovered from the SDK error's raw response —
+/// the HTTP status, the response headers, and the AWS request id — to a
+/// preserved provider response body. The status and headers let a generic
+/// retry layer classify and pace retries (rig#2210); the id is what AWS
+/// support asks for on failed calls (rig#2314). Rig-authored `ProviderError`
+/// diagnostics are left untouched: transport metadata belongs with what the
+/// provider actually said.
+fn attach_transport_metadata(
+    error: CompletionError,
+    status: Option<http::StatusCode>,
+    headers: Option<Box<http::HeaderMap>>,
+    request_id: Option<String>,
+) -> CompletionError {
     match error {
-        CompletionError::ProviderResponse(response) => {
-            CompletionError::ProviderResponse(response.with_provider_request_id(request_id))
-        }
+        CompletionError::ProviderResponse(response) => CompletionError::ProviderResponse(
+            response
+                .with_status(status)
+                .with_headers(headers)
+                .with_provider_request_id(request_id),
+        ),
         other => other,
     }
 }
 
 impl From<AwsSdkConverseError> for CompletionError {
     fn from(value: AwsSdkConverseError) -> Self {
+        // read every piece of transport metadata before the sdk error is consumed
         let raw_body = raw_response_body(&value.0);
+        let status = raw_status(&value.0);
+        let headers = raw_headers(&value.0);
         let request_id =
             aws_sdk_bedrockruntime::operation::RequestId::request_id(&value.0).map(str::to_string);
-        attach_request_id(
+        // a pure transport failure short-circuits as a retryable http error
+        let error = match transport_failure(value.0) {
+            Ok(error) => error,
+            Err(completion_error) => return completion_error,
+        };
+        attach_transport_metadata(
             gated(
-                with_raw_body(converse_message(value.0.into_service_error()), raw_body),
+                with_raw_body(converse_message(error.into_service_error()), raw_body),
                 CompletionError::from_provider_body,
                 CompletionError::ProviderError,
             ),
+            status,
+            headers,
             request_id,
         )
     }
@@ -214,18 +298,25 @@ pub(crate) fn converse_stream_output_completion_error(
 pub struct AwsSdkConverseStreamError(pub SdkError<ConverseStreamError, HttpResponse>);
 impl From<AwsSdkConverseStreamError> for CompletionError {
     fn from(value: AwsSdkConverseStreamError) -> Self {
+        // read every piece of transport metadata before the sdk error is consumed
         let raw_body = raw_response_body(&value.0);
+        let status = raw_status(&value.0);
+        let headers = raw_headers(&value.0);
         let request_id =
             aws_sdk_bedrockruntime::operation::RequestId::request_id(&value.0).map(str::to_string);
-        attach_request_id(
+        // a pure transport failure short-circuits as a retryable http error
+        let error = match transport_failure(value.0) {
+            Ok(error) => error,
+            Err(completion_error) => return completion_error,
+        };
+        attach_transport_metadata(
             gated(
-                with_raw_body(
-                    converse_stream_message(value.0.into_service_error()),
-                    raw_body,
-                ),
+                with_raw_body(converse_stream_message(error.into_service_error()), raw_body),
                 CompletionError::from_provider_body,
                 CompletionError::ProviderError,
             ),
+            status,
+            headers,
             request_id,
         )
     }
@@ -477,28 +568,94 @@ mod tests {
 }
 
 #[cfg(test)]
-mod request_id_tests {
+mod transport_metadata_tests {
     use super::*;
     use rig_core::ProviderResponseError;
 
-    /// rig#2314: the AWS request id attaches to preserved provider bodies and
-    /// leaves Rig-authored diagnostics untouched.
+    /// A 429's rate-limit metadata, as Bedrock would send it.
+    fn retry_after_headers() -> Box<http::HeaderMap> {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RETRY_AFTER,
+            http::HeaderValue::from_static("20"),
+        );
+        Box::new(headers)
+    }
+
+    /// rig#2314 + rig#2210: the AWS request id, raw HTTP status, and response
+    /// headers attach to preserved provider bodies and leave Rig-authored
+    /// diagnostics untouched.
     #[test]
-    fn attach_request_id_targets_provider_responses_only() {
-        let attached = attach_request_id(
-            CompletionError::ProviderResponse(ProviderResponseError::without_status("aws said no")),
+    fn attach_transport_metadata_targets_provider_responses_only() {
+        let attached = attach_transport_metadata(
+            CompletionError::ProviderResponse(ProviderResponseError::without_status(
+                "aws said no",
+            )),
+            Some(http::StatusCode::TOO_MANY_REQUESTS),
+            Some(retry_after_headers()),
             Some("aws-req-1".to_string()),
         );
         assert_eq!(attached.provider_request_id(), Some("aws-req-1"));
+        assert_eq!(
+            attached.provider_response_status(),
+            Some(http::StatusCode::TOO_MANY_REQUESTS),
+            "a throttle's status must survive so a generic retry layer can classify it"
+        );
+        assert_eq!(
+            attached
+                .provider_response_headers()
+                .and_then(|headers| headers.get(http::header::RETRY_AFTER))
+                .and_then(|value| value.to_str().ok()),
+            Some("20"),
+            "the captured Retry-After must stay readable"
+        );
         assert!(
             attached.to_string().contains("request id: aws-req-1"),
             "the id appears in the logged message: {attached}"
         );
 
-        let untouched = attach_request_id(
+        let untouched = attach_transport_metadata(
             CompletionError::ProviderError("rig diagnostic".to_string()),
+            Some(http::StatusCode::TOO_MANY_REQUESTS),
+            Some(retry_after_headers()),
             Some("aws-req-1".to_string()),
         );
         assert_eq!(untouched.provider_request_id(), None);
+        assert_eq!(untouched.provider_response_status(), None);
+    }
+
+    /// Absent transport metadata attaches as absent, never as an error.
+    #[test]
+    fn attach_transport_metadata_tolerates_absent_metadata() {
+        let attached = attach_transport_metadata(
+            CompletionError::ProviderResponse(ProviderResponseError::without_status(
+                "aws said no",
+            )),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(attached.provider_response_status(), None);
+        assert!(attached.provider_response_headers().is_none());
+        assert_eq!(attached.provider_request_id(), None);
+    }
+
+    /// A status captured at construction wins over a later attach, mirroring
+    /// the header rule that the site which saw the response is the authority.
+    #[test]
+    fn attach_transport_metadata_never_overwrites_a_constructed_status() {
+        let attached = attach_transport_metadata(
+            CompletionError::ProviderResponse(ProviderResponseError::new(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "aws said no",
+            )),
+            Some(http::StatusCode::TOO_MANY_REQUESTS),
+            None,
+            None,
+        );
+        assert_eq!(
+            attached.provider_response_status(),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        );
     }
 }

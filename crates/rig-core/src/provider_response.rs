@@ -54,6 +54,18 @@ impl ProviderResponseError {
         }
     }
 
+    /// Attach the HTTP status the response was captured with, when a capture
+    /// path recovered one after construction (e.g. an SDK transport that
+    /// built the body first and only later saw the raw response).
+    ///
+    /// The first capture wins: a status already present is never overwritten,
+    /// mirroring the enum-level `with_response_headers` rule that the site
+    /// which saw the response is the authority.
+    pub fn with_status(mut self, status: Option<StatusCode>) -> Self {
+        self.status = self.status.or(status);
+        self
+    }
+
     /// Attach the transport request id the failed response reported.
     pub fn with_provider_request_id(mut self, request_id: Option<String>) -> Self {
         self.provider_request_id = request_id.filter(|id| !id.is_empty());

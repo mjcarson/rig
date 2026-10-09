@@ -281,10 +281,26 @@ where
             ToolExecutionError::invalid_args(format!("failed to parse tool arguments: {original}"))
                 .with_source(original)
         }),
-        Err(error) => Err(ToolExecutionError::invalid_args(format!(
-            "failed to parse tool arguments: {error}"
-        ))
-        .with_source(error)),
+        Err(error) => {
+            // A missing field or an unterminated document usually means the
+            // model's tool call was cut off while generating a large argument,
+            // so point the model at a recovery it can actually take.
+            let rendered = error.to_string();
+            let hint = if error.classify() == serde_json::error::Category::Eof
+                || rendered.starts_with("missing field")
+            {
+                " (if a large argument value was omitted or cut off, the tool \
+                 call was likely truncated during generation; retry with \
+                 smaller arguments and build large payloads across multiple \
+                 calls)"
+            } else {
+                ""
+            };
+            Err(ToolExecutionError::invalid_args(format!(
+                "failed to parse tool arguments: {rendered}{hint}"
+            ))
+            .with_source(error))
+        }
     }
 }
 
@@ -941,6 +957,36 @@ mod tests {
         drop(execution);
 
         assert!(context.result::<String>().is_none());
+    }
+
+    #[test]
+    fn truncated_tool_arguments_carry_a_recovery_hint() {
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct Args {
+            name: String,
+            source: String,
+        }
+
+        // a valid-JSON call missing a required field reads as a tool call cut
+        // off while the model was generating a large argument
+        let error = parse_tool_args::<Args>(r#"{"name": "scanner"}"#)
+            .expect_err("a missing field should fail");
+        let message = error.to_string();
+        assert!(message.contains("missing field `source`"), "{message}");
+        assert!(message.contains("truncated"), "{message}");
+
+        // an unterminated document gets the same hint
+        let error = parse_tool_args::<Args>(r#"{"name": "scanner", "source": "let x"#)
+            .expect_err("an unterminated document should fail");
+        let message = error.to_string();
+        assert!(message.contains("truncated"), "{message}");
+
+        // an ordinary type mismatch does not
+        let error = parse_tool_args::<Args>(r#"{"name": 1, "source": "x"}"#)
+            .expect_err("a type mismatch should fail");
+        let message = error.to_string();
+        assert!(!message.contains("truncated"), "{message}");
     }
 
     #[tokio::test]

@@ -458,7 +458,7 @@ impl RawChoiceAccumulator {
         immediate: &mut Vec<StreamingRawChoice>,
     ) {
         if let Some(item_id) = item_id
-            && self.current_text_item.as_deref() != Some(item_id)
+            && self.current_text_item.as_deref() != Some(item_id.as_str())
         {
             self.current_text_item = Some(item_id.clone());
             immediate.push(streaming::RawStreamingChoice::TextStart {

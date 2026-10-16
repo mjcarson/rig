@@ -120,7 +120,8 @@ pub use hook::{
     HookStack, InvalidToolCallAction, InvalidToolCallContext, ModelSelection, ModelSelectionAction,
     ModelTurnAction, ModelTurnFinished, ObservationAction, ReasoningDelta, RequestPatch,
     RetryRequest, RunId, Scratchpad, StepEventKind, StreamResponseFinish, TextDelta, ToolCall,
-    ToolCallAction, ToolCallDelta, ToolResultAction, ToolResultEvent,
+    ToolCallAction, ToolCallDelta, ToolResultAction, ToolResultEvent, TurnsExhausted,
+    TurnsExhaustedAction,
 };
 pub use model::ModelHandle;
 pub use prompt_request::streaming::{

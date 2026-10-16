@@ -19,7 +19,7 @@ use crate::{
     agent::runner::{
         AgentRunner, CompletionCallOutcome, ModelTurnDecision, ToolExecution, append_run_messages,
         build_chat_span, new_execute_tool_span, observe_action, resolve_completion_call,
-        resolve_model_turn_action, run_single_tool,
+        resolve_model_turn_action, resolve_turns_exhausted, run_single_tool,
     },
     streaming::{StreamedAssistantContent, StreamedUserContent, ToolCallDeltaContent},
     tool::{ToolContext, server::ToolRegistrySnapshot},
@@ -434,7 +434,7 @@ pub(crate) fn store_error_usage(runner: &AgentRunner, run: &AgentRun) {
 /// a [`TurnSource`]. The streaming surface forwards the yielded [`DriveItem`]s;
 /// the blocking surface folds them to `Done`.
 pub(crate) fn drive_agent<S>(
-    runner: AgentRunner,
+    mut runner: AgentRunner,
     mut source: S,
     mut run: AgentRun,
     agent_span: tracing::Span,
@@ -491,6 +491,28 @@ where
             let step = match run.next_step() {
                 Ok(step) => step,
                 Err(err) => {
+                    // budget exhaustion is the one error a hook may answer: a
+                    // granted extension raises the live budget and resumes the
+                    // run in place on its still-pending request
+                    if let PromptError::MaxTurnsError { max_turns, chat_history, prompt } = &err
+                        && let Some(extra_turns) = resolve_turns_exhausted(
+                            &runner.config.hooks,
+                            &hook_ctx,
+                            *max_turns,
+                            prompt,
+                            chat_history,
+                        )
+                        .await
+                    {
+                        run.extend_max_turns(extra_turns);
+                        // Mirror the extension into the runner's config so the
+                        // per-turn progress log and the run-finished event keep
+                        // an honest denominator (and an extended budget-1 run
+                        // is not stuck below the `> 1` progress-log gate).
+                        runner.config.max_turns =
+                            runner.config.max_turns.saturating_add(extra_turns);
+                        continue 'outer;
+                    }
                     store_error_usage(&runner, &run);
                     yield Err(Box::new(err).into());
                     break 'outer;

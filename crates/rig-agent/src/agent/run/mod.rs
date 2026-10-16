@@ -465,6 +465,18 @@ impl AgentRun {
         self
     }
 
+    /// Raise the total model-call budget by `extra_turns` while the run is live.
+    ///
+    /// Pairs with the drivers' turns-exhausted hook: after
+    /// [`AgentRun::next_step`] returns [`PromptError::MaxTurnsError`] the
+    /// machine remains parked on its pending request, so a driver that obtains
+    /// an extension raises the budget here and steps again to resume the run in
+    /// place. Saturating; an extension of zero turns is a no-op.
+    pub fn extend_max_turns(&mut self, extra_turns: usize) {
+        // raise the cap, saturating so an absurd grant cannot wrap
+        self.max_turns = self.max_turns.saturating_add(extra_turns);
+    }
+
     /// Configure Tool output-mode validation (#1928): the JSON schema the
     /// output-tool arguments should satisfy, and how many times to re-prompt the
     /// model — when it finalizes without calling the output tool, or calls it
@@ -718,7 +730,10 @@ impl AgentRun {
     /// Advance the machine and return the next action for the driver.
     ///
     /// # Errors
-    /// - [`PromptError::MaxTurnsError`] when the total model-call budget is exhausted.
+    /// - [`PromptError::MaxTurnsError`] when the total model-call budget is
+    ///   exhausted. Budget exhaustion leaves the machine parked on its pending
+    ///   request, so a driver may raise the budget with
+    ///   [`AgentRun::extend_max_turns`] and step again to resume in place.
     /// - [`PromptError::PromptCancelled`] when the machine is driven out of
     ///   protocol (for example, calling this while a model response is
     ///   pending).
@@ -734,6 +749,10 @@ impl AgentRun {
                 let prompt = prompt_ref.clone();
 
                 if self.current_turn >= self.max_turns {
+                    // budget exhaustion is resumable: leave the machine parked
+                    // on its pending request so a driver may raise the budget
+                    // with `extend_max_turns` and step again to resume in place
+                    self.state = RunState::PreparingRequest;
                     return Err(PromptError::MaxTurnsError {
                         max_turns: self.max_turns,
                         chat_history: self.full_history().into(),
@@ -2062,6 +2081,58 @@ mod tests {
             PromptError::MaxTurnsError { max_turns: 3, .. }
         ));
         assert_eq!(run.turn(), 3);
+    }
+
+    #[test]
+    fn max_turns_error_is_resumable_via_extend() {
+        let mut run = AgentRun::new("loop").max_turns(1);
+
+        // consume the single budgeted call with a tool round-trip
+        let (_, _, turn) = expect_call_model(&mut run);
+        assert_eq!(turn, 1);
+        expect_continue(
+            run.model_response(tool_call_turn("call_1", "add"))
+                .expect("model_response should succeed"),
+        );
+        expect_call_tools(&mut run);
+        run.tool_results(vec![tool_result("call_1", "2")])
+            .expect("tool_results should succeed");
+
+        // the budget is spent: stepping errors but parks the pending request
+        let err = run
+            .next_step()
+            .expect_err("second model call should exceed budget");
+        let PromptError::MaxTurnsError {
+            chat_history: first_history,
+            ..
+        } = err
+        else {
+            panic!("expected a max-turns error");
+        };
+        // a zero-turn extension changes nothing: the same error fires again
+        run.extend_max_turns(0);
+        let err = run
+            .next_step()
+            .expect_err("a zero-turn extension should leave the budget spent");
+        let PromptError::MaxTurnsError {
+            max_turns,
+            chat_history: second_history,
+            ..
+        } = err
+        else {
+            panic!("expected a max-turns error");
+        };
+        // the park/re-step cycle must not grow or lose history
+        assert_eq!(max_turns, 1);
+        assert_eq!(first_history.len(), second_history.len());
+        // a real extension resumes the run in place on the parked request
+        run.extend_max_turns(1);
+        let (_, _, turn) = expect_call_model(&mut run);
+        assert_eq!(turn, 2);
+        expect_continue(
+            run.model_response(text_turn("done"))
+                .expect("model_response should succeed"),
+        );
     }
 
     #[test]

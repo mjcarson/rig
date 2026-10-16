@@ -39,6 +39,7 @@ use super::{
         CompletionResponse as CompletionResponseEvent, HookContext, HookStack,
         InvalidToolCallAction, ModelTurnAction, ModelTurnFinished, ObservationAction, RequestPatch,
         ToolCall as ToolCallEvent, ToolCallAction, ToolResultAction, ToolResultEvent,
+        TurnsExhausted, TurnsExhaustedAction,
     },
     model::ModelHandle,
     prompt_request::{
@@ -552,6 +553,37 @@ pub(crate) async fn resolve_completion_call(
         CompletionCallAction::Stop(reason) => CompletionCallOutcome::Terminate(reason),
         CompletionCallAction::Patch(patch) => CompletionCallOutcome::Proceed(Some(patch)),
         CompletionCallAction::Continue => CompletionCallOutcome::Proceed(None),
+    }
+}
+
+/// Fire the turns-exhausted hook for a run that just reported
+/// [`PromptError::MaxTurnsError`](crate::completion::PromptError::MaxTurnsError).
+///
+/// Returns `Some(extra_turns)` when a hook granted an extension the driver
+/// should apply with [`AgentRun::extend_max_turns`], or `None` when every hook
+/// declined and the error should surface to the caller.
+pub(crate) async fn resolve_turns_exhausted(
+    hooks: &HookStack,
+    ctx: &HookContext,
+    max_turns: usize,
+    prompt: &Message,
+    history: &[Message],
+) -> Option<usize> {
+    // consult the hooks; the first extension wins
+    match hooks
+        .on_turns_exhausted(
+            ctx,
+            TurnsExhausted {
+                max_turns,
+                prompt,
+                history,
+            },
+        )
+        .await
+    {
+        // treat a zero-turn extension as a decline
+        TurnsExhaustedAction::Extend { extra_turns } if extra_turns > 0 => Some(extra_turns),
+        _ => None,
     }
 }
 
@@ -1603,7 +1635,7 @@ mod migrated_tests {
         CompletionCallAction, CompletionCallEvent, HookStack, InvalidToolCallAction,
         InvalidToolCallContext, ModelTurnAction, ModelTurnFinished, ObservationAction,
         ReasoningDelta, StreamResponseFinish, TextDelta, ToolCall, ToolCallAction, ToolCallDelta,
-        ToolResultAction, ToolResultEvent,
+        ToolResultAction, ToolResultEvent, TurnsExhausted, TurnsExhaustedAction,
     };
 
     use std::sync::{
@@ -3300,6 +3332,94 @@ mod migrated_tests {
             other => panic!("expected streaming max-turns error, got {other:?}"),
         }
         assert_eq!(streaming_recorded.request_count(), 1);
+    }
+
+    /// A turns-exhausted hook that grants one single-call extension per instance.
+    #[derive(Clone, Default)]
+    struct ExtendOnceHook {
+        granted: Arc<AtomicBool>,
+    }
+
+    impl AgentHook for ExtendOnceHook {
+        async fn on_turns_exhausted(
+            &self,
+            _ctx: &HookContext,
+            _event: TurnsExhausted<'_>,
+        ) -> TurnsExhaustedAction {
+            // grant exactly one extra model call, then decline forever
+            if self.granted.swap(true, SeqCst) {
+                TurnsExhaustedAction::fail()
+            } else {
+                TurnsExhaustedAction::extend(1)
+            }
+        }
+    }
+
+    /// Both prompt surfaces resume a budget-one run in place when a hook grants
+    /// a turns-exhausted extension, and surface the budget error once the hook
+    /// declines.
+    #[tokio::test]
+    async fn prompt_surfaces_resume_after_turns_exhausted_extension() {
+        // the blocking surface: tool round-trip at budget one + a granted extension
+        let blocking_model = blocking_model();
+        let blocking_recorded = blocking_model.clone();
+        let blocking_agent = AgentBuilder::new(blocking_model)
+            .tool(MockAddTool)
+            .add_hook(ExtendOnceHook::default())
+            .build();
+        let blocking_response = blocking_agent
+            .prompt("add 2 and 3")
+            .max_turns(1)
+            .await
+            .expect("blocking prompt should resume on the granted extension");
+        assert_eq!(blocking_response, "the answer is 5");
+        assert_eq!(blocking_recorded.request_count(), 2);
+
+        // the streaming surface: same scenario, same in-place resumption
+        let streaming_model = streaming_model();
+        let streaming_recorded = streaming_model.clone();
+        let streaming_agent = AgentBuilder::new(streaming_model)
+            .tool(MockAddTool)
+            .add_hook(ExtendOnceHook::default())
+            .build();
+        let mut stream = streaming_agent
+            .stream_prompt("add 2 and 3")
+            .max_turns(1)
+            .await;
+        let mut streaming_err = None;
+        while let Some(item) = stream.next().await {
+            if let Err(err) = item {
+                streaming_err = Some(err);
+                break;
+            }
+        }
+        assert!(
+            streaming_err.is_none(),
+            "streaming should resume on the granted extension, got {streaming_err:?}"
+        );
+        assert_eq!(streaming_recorded.request_count(), 2);
+
+        // once the hook declines, the (raised) budget error surfaces as before
+        let declining_model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("tc1", "add", json!({"x": 2, "y": 3})),
+            MockTurn::tool_call("tc2", "add", json!({"x": 1, "y": 4})),
+            MockTurn::text("never reached"),
+        ]);
+        let declining_recorded = declining_model.clone();
+        let declining_agent = AgentBuilder::new(declining_model)
+            .tool(MockAddTool)
+            .add_hook(ExtendOnceHook::default())
+            .build();
+        let err = declining_agent
+            .prompt("add some things")
+            .max_turns(1)
+            .await
+            .expect_err("a declined second extension should surface the budget error");
+        assert!(matches!(
+            err,
+            PromptError::MaxTurnsError { max_turns: 2, .. }
+        ));
+        assert_eq!(declining_recorded.request_count(), 2);
     }
 
     /// run() and stream() of the same tool-calling scenario produce the same

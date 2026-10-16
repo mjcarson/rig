@@ -1039,6 +1039,53 @@ impl CompletionCallAction {
     }
 }
 
+/// Budget-exhaustion event: the run has another model call to make but the
+/// total model-call budget is spent.
+///
+/// Fired by the drivers at the moment [`AgentRun`](crate::agent::AgentRun)'s
+/// `next_step` reports `PromptError::MaxTurnsError`, before the error is
+/// surfaced to the caller. The run machine stays parked on its pending
+/// request, so a hook that answers with [`TurnsExhaustedAction::Extend`]
+/// resumes the run in place.
+#[derive(Clone, Copy)]
+pub struct TurnsExhausted<'a> {
+    /// The exhausted total model-call budget (including prior extensions).
+    pub max_turns: usize,
+    /// The pending prompt the run could not dispatch.
+    pub prompt: &'a Message,
+    /// The full canonical history at exhaustion.
+    pub history: &'a [Message],
+}
+
+/// Action for the budget-exhaustion event.
+///
+/// In a [`HookStack`] the first hook returning [`TurnsExhaustedAction::Extend`]
+/// wins and later hooks are not invoked; [`TurnsExhaustedAction::Fail`] (the
+/// default) preserves the erroring behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnsExhaustedAction {
+    /// Decline: the run fails with `PromptError::MaxTurnsError` (default).
+    Fail,
+    /// Raise the total model-call budget by `extra_turns` and continue the run
+    /// in place. An extension of zero turns is treated as [`Self::Fail`].
+    Extend {
+        /// How many extra model calls to grant.
+        extra_turns: usize,
+    },
+}
+
+impl TurnsExhaustedAction {
+    /// Creates an action that lets the run fail with its budget error.
+    pub fn fail() -> Self {
+        Self::Fail
+    }
+
+    /// Creates an action that raises the model-call budget by `extra_turns`.
+    pub fn extend(extra_turns: usize) -> Self {
+        Self::Extend { extra_turns }
+    }
+}
+
 /// Action for pre-tool hooks.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolCallAction {
@@ -1258,6 +1305,21 @@ pub trait AgentHook: WasmCompatSend + WasmCompatSync {
         async { ModelTurnAction::Continue }
     }
 
+    /// Decides whether a run whose model-call budget is exhausted may continue.
+    ///
+    /// Fired when the run still has a pending request but the total model-call
+    /// budget is spent, before `PromptError::MaxTurnsError` is surfaced to the
+    /// caller. Returning [`TurnsExhaustedAction::Extend`] raises the budget via
+    /// [`AgentRun::extend_max_turns`](crate::agent::AgentRun::extend_max_turns)
+    /// and resumes the run in place. The default action lets the run fail.
+    fn on_turns_exhausted(
+        &self,
+        _ctx: &HookContext,
+        _event: TurnsExhausted<'_>,
+    ) -> impl Future<Output = TurnsExhaustedAction> + WasmCompatSend {
+        async { TurnsExhaustedAction::Fail }
+    }
+
     /// Resolves a model-emitted tool call that cannot be dispatched as written.
     ///
     /// The call may be failed, retried, repaired, skipped, or used to stop the
@@ -1380,6 +1442,12 @@ macro_rules! for_each_boxed_hook_event {
             on_model_turn_finished,
             ModelTurnFinished,
             ModelTurnAction
+        );
+        $m!(
+            turns_exhausted,
+            on_turns_exhausted,
+            TurnsExhausted,
+            TurnsExhaustedAction
         );
         $m!(
             tool_result,
@@ -1580,6 +1648,13 @@ impl ShortCircuitAction for ModelTurnAction {
     }
 }
 
+impl ShortCircuitAction for TurnsExhaustedAction {
+    const CONTINUE: Self = TurnsExhaustedAction::Fail;
+    fn is_continue(&self) -> bool {
+        matches!(self, TurnsExhaustedAction::Fail)
+    }
+}
+
 /// Dispatches to each hook in registration order, returning the first action
 /// that is not `Continue` without invoking the remaining hooks.
 async fn first_non_continue<'a, A, F>(hooks: &'a [Arc<dyn DynAgentHook>], mut dispatch: F) -> A
@@ -1662,6 +1737,7 @@ impl AgentHook for HookStack {
     stack_first_non_continue! {
         on_completion_response, completion_response, CompletionResponse, ObservationAction;
         on_model_turn_finished, model_turn_finished, ModelTurnFinished, ModelTurnAction;
+        on_turns_exhausted, turns_exhausted, TurnsExhausted, TurnsExhaustedAction;
         on_text_delta, text_delta, TextDelta, ObservationAction;
         on_reasoning_delta, reasoning_delta, ReasoningDelta, ObservationAction;
         on_tool_call_delta, tool_call_delta, ToolCallDelta, ObservationAction;
@@ -1752,6 +1828,49 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn turns_exhausted_first_extension_wins() {
+        struct Extender(usize);
+        impl AgentHook for Extender {
+            async fn on_turns_exhausted(
+                &self,
+                _ctx: &HookContext,
+                _event: TurnsExhausted<'_>,
+            ) -> TurnsExhaustedAction {
+                TurnsExhaustedAction::extend(self.0)
+            }
+        }
+        // a declining hook ahead of two extenders: the first extension wins
+        let mut stack = HookStack::with(());
+        stack.push(Extender(3));
+        stack.push(Extender(7));
+        let prompt = Message::user("hi");
+        let action = stack
+            .on_turns_exhausted(
+                &HookContext::new(false, None),
+                TurnsExhausted {
+                    max_turns: 5,
+                    prompt: &prompt,
+                    history: &[],
+                },
+            )
+            .await;
+        assert_eq!(action, TurnsExhaustedAction::extend(3));
+        // an all-declining stack falls through to the default failure
+        let empty = HookStack::default();
+        let action = empty
+            .on_turns_exhausted(
+                &HookContext::new(false, None),
+                TurnsExhausted {
+                    max_turns: 5,
+                    prompt: &prompt,
+                    history: &[],
+                },
+            )
+            .await;
+        assert_eq!(action, TurnsExhaustedAction::fail());
     }
 
     #[derive(Clone)]

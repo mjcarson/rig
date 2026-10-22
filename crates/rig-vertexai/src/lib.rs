@@ -11,13 +11,18 @@
 //! Google Cloud Vertex AI provider integration for Rig.
 //!
 //! This crate exposes Vertex AI hosted model completions through Rig's
-//! completion traits. Configure Google Cloud Application Default Credentials or
-//! provide credentials through Google Cloud's standard environment before
-//! constructing a client.
+//! completion traits: Gemini models through [`Client`] (the `google` publisher,
+//! unary only), and Claude models through
+//! [`anthropic::AnthropicVertexClient`] (the `anthropic` publisher over the
+//! native Anthropic Messages API, with tools, prompt caching, and streaming).
+//! Configure Google Cloud Application Default Credentials or provide
+//! credentials through Google Cloud's standard environment before constructing
+//! a client.
 //!
 //! The root `rig` facade re-exports this crate as `rig::vertexai` when the
 //! `vertexai` feature is enabled.
 
+pub mod anthropic;
 pub mod client;
 pub mod completion;
 pub(crate) mod types;

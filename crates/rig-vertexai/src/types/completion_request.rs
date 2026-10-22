@@ -15,6 +15,17 @@ impl VertexCompletionRequest {
         // Vertex's `functionResponse.name` is the *function name*, not a
         // call identifier — `ToolResult::name` carries it as required data.
         let mut history: Vec<rig_core::completion::Message> = self.0.chat_history.clone();
+        // request documents (e.g. agent-hook context patches) must reach the
+        // model; mirror rig-core's placement after any leading system messages
+        if let Some(documents) = self.0.normalized_documents() {
+            let insert_at = history
+                .iter()
+                .position(|message| {
+                    !matches!(message, rig_core::completion::Message::System { .. })
+                })
+                .unwrap_or(history.len());
+            history.insert(insert_at, documents);
+        }
         // Cross-provider ingested results arrive with an empty name and
         // their paired call carries it.
         rig_core::providers::internal::resolve_empty_tool_result_names(&mut history);
@@ -329,6 +340,27 @@ mod tests {
             output_schema: None,
             record_telemetry_content: false,
         }
+    }
+
+    /// Request documents carry agent-hook context patches (turn-budget and
+    /// context-pressure warnings), so dropping them breaks hook-driven agents.
+    #[test]
+    fn documents_land_in_the_contents_before_the_chat_history() {
+        let mut request = minimal_request();
+        request.documents = vec![rig_core::completion::Document {
+            id: "budget".to_string(),
+            text: "only two turns remain".to_string(),
+            additional_props: Default::default(),
+        }];
+
+        let contents = VertexCompletionRequest(request).contents().unwrap();
+
+        // the documents message is prepended as its own user turn
+        assert_eq!(contents.len(), 2);
+        let rendered = format!("{:?}", contents[0]);
+        assert!(rendered.contains("only two turns remain"));
+        let original = format!("{:?}", contents[1]);
+        assert!(original.contains("test"));
     }
 
     /// `functionResponse.name` is the executed function's name: read from

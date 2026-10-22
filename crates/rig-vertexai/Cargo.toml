@@ -11,8 +11,12 @@ workspace = true
 
 [dependencies]
 base64 = { workspace = true }
+bytes = { workspace = true }
 google-cloud-aiplatform-v1 = { workspace = true }
 google-cloud-auth = { workspace = true }
+google-cloud-gax = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
 rig-core = { path = "../rig-core", version = "0.42.0", default-features = false }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

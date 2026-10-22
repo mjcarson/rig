@@ -35,10 +35,37 @@ pub enum VertexAiClientError {
         "Vertex AI uses Application Default Credentials (ADC). Use `Client::from_env()` for default credentials or `Client::builder().with_credentials(...).build()` for explicit credentials."
     )]
     InvalidInput,
+    #[error("failed to build the Claude on Vertex AI client: {0}")]
+    AnthropicClient(String),
+    #[error(
+        "Vertex AI uses Google Cloud credentials. Use `AnthropicVertexClient::from_env()` for default credentials or `AnthropicVertexClient::builder()` for explicit configuration."
+    )]
+    AnthropicInvalidInput,
+}
+
+/// The Vertex AI host serving a location
+///
+/// The `global` endpoint lives on the bare host, the `us`/`eu` multi-region
+/// endpoints live on dedicated `rep` hosts, and every other location gets a
+/// regional host. The host and the location in the request path must always
+/// agree, so both come from the same resolved location.
+///
+/// # Arguments
+///
+/// * `location` - The location requests are served from
+pub(crate) fn vertex_host(location: &str) -> String {
+    match location {
+        // the global endpoint lives on the bare host
+        "global" => "https://aiplatform.googleapis.com".to_string(),
+        // the multi-region endpoints live on dedicated rep hosts
+        "us" | "eu" => format!("https://aiplatform.{location}.rep.googleapis.com"),
+        // everything else is a regional host
+        region => format!("https://{region}-aiplatform.googleapis.com"),
+    }
 }
 
 /// Helper function to build credentials with optional service account impersonation.
-fn build_credentials(
+pub(crate) fn build_credentials(
     explicit_creds: Option<Credentials>,
 ) -> Result<Credentials, VertexAiClientError> {
     if let Some(creds) = explicit_creds {
@@ -207,10 +234,19 @@ impl Client {
         &self,
     ) -> Result<&vertexai::client::PredictionService, VertexAiClientError> {
         let credentials = self.credentials.clone();
+        // non-global locations are only served from their own host, so the
+        // endpoint must follow the location or regional requests 404; the
+        // global default stays unset so the SDK's universe-domain resolution
+        // (sovereign/partner clouds) keeps working
+        let endpoint = (self.location != DEFAULT_LOCATION).then(|| vertex_host(&self.location));
         self.vertex_client
             .get_or_init(|| async {
                 let mut builder = vertexai::client::PredictionService::builder();
                 builder = builder.with_credentials(credentials);
+                // only pin the endpoint when the location demands one
+                if let Some(endpoint) = endpoint {
+                    builder = builder.with_endpoint(endpoint);
+                }
                 builder
                     .build()
                     .await

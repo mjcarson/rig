@@ -1,6 +1,9 @@
 ## Rig-VertexAI
 
-This companion crate integrates Google Cloud Vertex AI (hosted models including Gemini) as a model provider with Rig.
+This companion crate integrates Google Cloud Vertex AI as a model provider with Rig:
+
+- **Gemini models** (the `google` publisher) through `rig_vertexai::Client`, unary completions.
+- **Claude models** (the `anthropic` publisher) through `rig_vertexai::anthropic::AnthropicVertexClient`, speaking the native Anthropic Messages API over `rawPredict`/`streamRawPredict` with tools, prompt caching, and streaming.
 
 ## Usage
 
@@ -22,4 +25,19 @@ Make sure to have Google Cloud credentials configured. You can use Application D
 
 ```shell
 gcloud auth application-default login
+```
+
+Both clients read `GOOGLE_CLOUD_PROJECT` (required) and `GOOGLE_CLOUD_LOCATION`
+(optional, defaults to `global`) from the environment, and honor
+`GOOGLE_CLOUD_SERVICE_ACCOUNT` for service account impersonation when
+credentials come from the ADC chain. Explicit credentials can be supplied
+through each client's builder; the Claude client additionally accepts a parsed
+service account key JSON directly:
+
+```rust,ignore
+let client = rig_vertexai::anthropic::AnthropicVertexClient::builder()
+    .project("my-project")
+    .location("us-east5")
+    .service_account_key(serde_json::from_str(&key_json)?)
+    .build()?;
 ```

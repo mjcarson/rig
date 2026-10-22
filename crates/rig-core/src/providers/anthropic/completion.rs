@@ -45,6 +45,57 @@ pub trait AnthropicCompatibleProvider: Provider {
     /// simply yields `None` — never an error.
     const REQUEST_ID_HEADER: Option<&'static str> = Some("request-id");
 
+    /// Whether the serialized request body carries the `model` field.
+    ///
+    /// Gateways that address the model in the URL instead (Claude on Vertex AI
+    /// rejects a body containing `model`) set this to `false` and route it via
+    /// [`AnthropicCompatibleProvider::completion_path`].
+    const MODEL_IN_BODY: bool = true;
+
+    /// The request path of the Messages endpoint for `model`.
+    ///
+    /// Providers that bake the model into the URL (Claude on Vertex AI's
+    /// `models/{model}:rawPredict`) override this; everyone else posts to the
+    /// standard Messages path.
+    ///
+    /// # Arguments
+    ///
+    /// * `model` - The resolved model id for this request
+    fn completion_path(model: &str) -> std::borrow::Cow<'static, str> {
+        let _ = model;
+        std::borrow::Cow::Borrowed("/v1/messages")
+    }
+
+    /// The request path of the streaming Messages endpoint for `model`.
+    ///
+    /// Defaults to [`AnthropicCompatibleProvider::completion_path`]; providers
+    /// with a dedicated streaming verb (Claude on Vertex AI's
+    /// `:streamRawPredict`) override this.
+    ///
+    /// # Arguments
+    ///
+    /// * `model` - The resolved model id for this request
+    fn streaming_completion_path(model: &str) -> std::borrow::Cow<'static, str> {
+        Self::completion_path(model)
+    }
+
+    /// Provider-mandated top-level body fields merged into every request.
+    ///
+    /// Merged under the caller's `additional_params`, so an explicit caller
+    /// value for the same key still wins (e.g. a newer `anthropic_version`
+    /// than the one a Vertex AI flavor injects by default). Keys must not
+    /// collide with the typed request's own fields (`model`, `max_tokens`,
+    /// `temperature`, ...): the merged params are flattened alongside them, so
+    /// a collision would emit a duplicate JSON key.
+    ///
+    /// # Arguments
+    ///
+    /// * `model` - The resolved model id for this request
+    fn required_body_params(model: &str) -> Option<serde_json::Value> {
+        let _ = model;
+        None
+    }
+
     fn default_max_tokens(model: &str) -> Option<u64> {
         let _ = model;
         None
@@ -1598,7 +1649,7 @@ where
         &self,
         mut completion_request: completion::CompletionRequest,
         operation: CompletionOperation,
-    ) -> Result<(tracing::Span, AnthropicCompletionRequest), CompletionError> {
+    ) -> Result<(tracing::Span, String, AnthropicCompletionRequest), CompletionError> {
         let request_model = completion_request
             .model
             .clone()
@@ -1631,7 +1682,9 @@ where
             self.strict_tools,
         )?;
 
-        Ok((span, request))
+        // the resolved model rides along for providers that address it in the
+        // URL path instead of (or in addition to) the body
+        Ok((span, request_model, request))
     }
 
     /// A model with every caching / strictness knob off, differing from its
@@ -1810,10 +1863,20 @@ where
     }
 }
 
-/// Anthropic requires a `max_tokens` parameter to be set, which is dependent on the model. If not
-/// set or if set too high, the request will fail. The following values are based on Anthropic's
-/// published synchronous Messages API output limits for current models.
-fn default_max_tokens_for_model(model: &str) -> Option<u64> {
+/// The default `max_tokens` Rig assumes for Anthropic's own model ids
+///
+/// Anthropic requires a `max_tokens` parameter to be set, which is dependent
+/// on the model; if not set or if set too high, the request will fail. The
+/// values are based on Anthropic's published synchronous Messages API output
+/// limits for current models, and compatible providers that serve first-party
+/// model ids (Claude on Vertex AI, gateways) can reuse the table from their
+/// [`AnthropicCompatibleProvider::default_max_tokens`]. Returns `None` for
+/// ids the table does not know.
+///
+/// # Arguments
+///
+/// * `model` - The model id to look up a default for
+pub fn default_max_tokens_for_model(model: &str) -> Option<u64> {
     if model.starts_with("claude-opus-4-8")
         || model.starts_with("claude-opus-4-7")
         || model.starts_with("claude-opus-4-6")
@@ -2345,7 +2408,10 @@ struct OutputConfig {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(super) struct AnthropicCompletionRequest {
-    model: String,
+    /// `None` only for providers with [`AnthropicCompatibleProvider::MODEL_IN_BODY`]
+    /// set to `false`, which address the model in the URL path instead
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     messages: Vec<Message>,
     max_tokens: u64,
     /// System prompt as array of content blocks to support cache_control
@@ -2813,6 +2879,38 @@ pub struct AnthropicRequestParams<'a> {
     pub static_prefix_cache_ttl: Option<CacheTtl>,
 }
 
+/// Merge provider-mandated body fields under the caller's additional params
+///
+/// Keys the caller already set are left untouched so an explicit value (e.g. a
+/// newer `anthropic_version` than a gateway's default) always wins. A `Null`
+/// payload is replaced wholesale; a non-object payload is left alone — it will
+/// fail the top-level flatten with its own serialization error either way.
+///
+/// # Arguments
+///
+/// * `payload` - The caller's additional params, already drained of tools and cache control
+/// * `required` - The provider-mandated fields from [`AnthropicCompatibleProvider::required_body_params`]
+fn merge_required_body_params(
+    payload: &mut serde_json::Value,
+    required: Option<serde_json::Value>,
+) {
+    // nothing to merge for providers without mandated fields (the default)
+    let Some(required) = required else {
+        return;
+    };
+    // an absent caller payload takes the required fields wholesale
+    if payload.is_null() {
+        *payload = required;
+        return;
+    }
+    // otherwise fill in only the keys the caller did not set themselves
+    if let (Some(payload), Some(required)) = (payload.as_object_mut(), required.as_object()) {
+        for (key, value) in required {
+            payload.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+}
+
 impl AnthropicCompletionRequest {
     pub(super) fn try_from_params<Ext>(
         params: AnthropicRequestParams<'_>,
@@ -2861,6 +2959,13 @@ impl AnthropicCompletionRequest {
         )?;
         let mut tools =
             build_tool_definitions::<Ext>(req.tools, &mut additional_params_payload, strict_tools)?;
+        // merge provider-mandated body fields under the caller's params (after
+        // the tools/cache_control drains above) so an explicit caller value for
+        // the same key still wins
+        merge_required_body_params(
+            &mut additional_params_payload,
+            Ext::required_body_params(model),
+        );
 
         // Convert system prompt to array format for cache_control support
         let mut system = if let Some(preamble) = req.preamble {
@@ -2899,7 +3004,8 @@ impl AnthropicCompletionRequest {
         };
 
         Ok(Self {
-            model: model.to_string(),
+            // providers that address the model in the URL leave it out of the body
+            model: Ext::MODEL_IN_BODY.then(|| model.to_string()),
             messages,
             max_tokens,
             system,
@@ -2993,7 +3099,7 @@ where
         &self,
         completion_request: completion::CompletionRequest,
     ) -> Result<CompletionResponse, CompletionError> {
-        let (span, request) =
+        let (span, request_model, request) =
             self.prepare_request(completion_request, CompletionOperation::Chat)?;
 
         crate::providers::internal::trace_json(
@@ -3006,7 +3112,7 @@ where
 
         let req = self
             .client
-            .post("/v1/messages")?
+            .post(Ext::completion_path(&request_model).as_ref())?
             .body(request)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
 
@@ -3114,6 +3220,129 @@ mod tests {
     fn unknown_model_uses_conservative_default_max_tokens_fallback() {
         assert_eq!(default_max_tokens_for_model("claude-unknown"), None);
         assert_eq!(default_max_tokens_with_fallback("claude-unknown"), 2_048);
+    }
+
+    /// A provider that addresses the model in the URL, Claude-on-Vertex style
+    #[derive(Debug, Default, Clone, Copy)]
+    struct UrlAddressedExt;
+
+    impl Provider for UrlAddressedExt {
+        type Builder = UrlAddressedProviderBuilder;
+
+        const VERIFY_PATH: &'static str = "/v1/models";
+    }
+
+    impl crate::client::DebugExt for UrlAddressedExt {}
+
+    /// The builder typestate shim for [`UrlAddressedExt`]
+    #[derive(Debug, Default, Clone, Copy)]
+    struct UrlAddressedProviderBuilder;
+
+    impl crate::client::ProviderBuilder for UrlAddressedProviderBuilder {
+        type Extension<H>
+            = UrlAddressedExt
+        where
+            H: HttpClientExt;
+        type ApiKey = crate::client::Nothing;
+
+        const BASE_URL: &'static str = "https://example.invalid";
+
+        fn build<H>(
+            _builder: &crate::client::ClientBuilder<Self, Self::ApiKey, H>,
+        ) -> crate::http_client::Result<Self::Extension<H>>
+        where
+            H: HttpClientExt,
+        {
+            Ok(UrlAddressedExt)
+        }
+    }
+
+    impl AnthropicCompatibleProvider for UrlAddressedExt {
+        const PROVIDER_NAME: &'static str = "url-addressed";
+
+        const MODEL_IN_BODY: bool = false;
+
+        fn completion_path(model: &str) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Owned(format!("/models/{model}:rawPredict"))
+        }
+
+        fn streaming_completion_path(model: &str) -> std::borrow::Cow<'static, str> {
+            std::borrow::Cow::Owned(format!("/models/{model}:streamRawPredict"))
+        }
+
+        fn required_body_params(_model: &str) -> Option<serde_json::Value> {
+            Some(json!({ "anthropic_version": "vertex-2023-10-16" }))
+        }
+    }
+
+    /// Build a typed request through an Ext's hooks for the body-shape tests
+    fn request_body_for<Ext: AnthropicCompatibleProvider>(
+        additional_params: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let request = AnthropicCompletionRequest::try_from_params::<Ext>(
+            AnthropicRequestParams {
+                model: CLAUDE_SONNET_4_6,
+                request: completion_request_with_tools(vec![], additional_params),
+                prompt_caching: false,
+                automatic_caching: false,
+                automatic_caching_ttl: None,
+                static_prefix_cache_ttl: None,
+            },
+            false,
+        )
+        .unwrap();
+        serde_json::to_value(request).unwrap()
+    }
+
+    #[test]
+    fn default_provider_keeps_model_in_body_and_the_messages_path() {
+        let body = request_body_for::<crate::providers::anthropic::client::AnthropicExt>(None);
+
+        assert_eq!(body["model"], CLAUDE_SONNET_4_6);
+        assert!(body.get("anthropic_version").is_none());
+        assert_eq!(
+            crate::providers::anthropic::client::AnthropicExt::completion_path(CLAUDE_SONNET_4_6),
+            "/v1/messages"
+        );
+        assert_eq!(
+            crate::providers::anthropic::client::AnthropicExt::streaming_completion_path(
+                CLAUDE_SONNET_4_6
+            ),
+            "/v1/messages"
+        );
+    }
+
+    #[test]
+    fn url_addressed_provider_omits_model_and_injects_required_params() {
+        let body = request_body_for::<UrlAddressedExt>(None);
+
+        // the model rides in the URL, never the body
+        assert!(body.get("model").is_none());
+        // the provider-mandated version field lands at the top level
+        assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+        // the rest of the typed request is untouched
+        assert_eq!(body["max_tokens"], 64);
+        assert_eq!(
+            UrlAddressedExt::completion_path(CLAUDE_SONNET_4_6),
+            format!("/models/{CLAUDE_SONNET_4_6}:rawPredict")
+        );
+        assert_eq!(
+            UrlAddressedExt::streaming_completion_path(CLAUDE_SONNET_4_6),
+            format!("/models/{CLAUDE_SONNET_4_6}:streamRawPredict")
+        );
+    }
+
+    #[test]
+    fn caller_additional_params_outrank_required_body_params() {
+        let body = request_body_for::<UrlAddressedExt>(Some(json!({
+            "anthropic_version": "2026-10-21",
+            "top_k": 4,
+        })));
+
+        // an explicit caller value for a mandated key wins over the provider default
+        assert_eq!(body["anthropic_version"], "2026-10-21");
+        // unrelated caller params still flatten through
+        assert_eq!(body["top_k"], 4);
     }
 
     #[test]

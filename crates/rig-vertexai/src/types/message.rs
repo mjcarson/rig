@@ -3,8 +3,8 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use google_cloud_aiplatform_v1 as vertexai;
 use rig_core::completion::CompletionError;
 use rig_core::message::{
-    AssistantContent, DocumentSourceKind, Image, ImageMediaType, Message, MimeType, Text,
-    ToolResultContent, UserContent,
+    AssistantContent, DocumentMediaType, DocumentSourceKind, Image, ImageMediaType, Message,
+    MimeType, Text, ToolResultContent, UserContent,
 };
 use std::collections::HashSet;
 
@@ -83,6 +83,12 @@ impl TryFrom<RigMessage> for vertexai::model::Content {
 
                             Ok(vertexai::model::Part::new()
                                 .set_function_response(function_response))
+                        }
+                        UserContent::Document(document) => {
+                            // text-like documents (rig's own request documents
+                            // arrive as TXT strings) become plain text parts,
+                            // matching rig-core's Gemini conversion
+                            vertex_document_text_part(document)
                         }
                         _ => Err(CompletionError::ProviderError(format!(
                             "Unsupported user content type: {:?}",
@@ -186,6 +192,63 @@ fn collect_json_ref_names(value: &serde_json::Value, names: &mut HashSet<String>
         }
         _ => {}
     }
+}
+
+/// Convert a text-like user document into a plain text part
+///
+/// Rig's own request documents (retrieval context, agent-hook context patches)
+/// arrive as TXT strings, so text-like media types render inline the way
+/// rig-core's Gemini provider renders them. Binary and remote documents are
+/// not modeled on this SDK path and error honestly instead of being dropped.
+///
+/// # Arguments
+///
+/// * `document` - The user document to convert
+fn vertex_document_text_part(
+    document: rig_core::message::Document,
+) -> Result<vertexai::model::Part, CompletionError> {
+    // mirror rig-core's Gemini rule: a document without a mime type is an error
+    let Some(media_type) = document.media_type else {
+        return Err(CompletionError::ProviderError(
+            "A mime type is required for document inputs to Vertex AI".to_string(),
+        ));
+    };
+    // only text-like documents render inline as plain text
+    if !matches!(
+        media_type,
+        DocumentMediaType::TXT
+            | DocumentMediaType::RTF
+            | DocumentMediaType::HTML
+            | DocumentMediaType::CSS
+            | DocumentMediaType::MARKDOWN
+            | DocumentMediaType::CSV
+            | DocumentMediaType::XML
+            | DocumentMediaType::Javascript
+            | DocumentMediaType::Python
+    ) {
+        return Err(CompletionError::ProviderError(format!(
+            "Unsupported document media type for Vertex AI: {}",
+            media_type.to_mime_type()
+        )));
+    }
+    // inline string content passes through; base64 text is decoded first
+    let text = match document.data {
+        DocumentSourceKind::String(text) => text,
+        DocumentSourceKind::Base64(data) => {
+            let decoded = BASE64.decode(data.as_bytes()).map_err(|error| {
+                CompletionError::ProviderError(format!("Failed to decode base64: {error}"))
+            })?;
+            String::from_utf8(decoded).map_err(|error| {
+                CompletionError::ProviderError(format!("Invalid UTF-8 in document: {error}"))
+            })?
+        }
+        other => {
+            return Err(CompletionError::ProviderError(format!(
+                "Unsupported document source for Vertex AI: {other:?}"
+            )));
+        }
+    };
+    Ok(vertexai::model::Part::new().set_text(text))
 }
 
 fn vertex_tool_result_image_part(

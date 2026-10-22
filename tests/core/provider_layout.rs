@@ -181,8 +181,12 @@ const PROVIDER_WIRES: &[(&str, WireCoverage)] = &[
     (
         "rig-vertexai",
         Exempt(
-            "Vertex AI Gemini, unary only — `stream()` returns `streaming_unsupported()`, so \
-             there is no streaming wire to conform. Adding streaming here means adding a family.",
+            "Vertex AI. The Gemini path is unary only — `stream()` returns \
+             `streaming_unsupported()`, so it has no streaming wire to conform; adding Gemini \
+             streaming here means adding a family. The Claude path (`anthropic` module) consumes \
+             rig-core's Anthropic Messages wire verbatim through `GenericCompletionModel` and \
+             `AnthropicAdapter` (like rig-bedrock's mantle), so the `anthropic` family suite \
+             covers its stream decoding.",
         ),
     ),
     (

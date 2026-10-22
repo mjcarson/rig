@@ -565,7 +565,7 @@ where
         &self,
         completion_request: CompletionRequest,
     ) -> Result<RawStreamingResult<StreamingCompletionResponse>, CompletionError> {
-        let (span, request) =
+        let (span, request_model, request) =
             self.prepare_request(completion_request, CompletionOperation::ChatStreaming)?;
 
         // Logged after the streaming-only patches, not on the shared typed
@@ -582,7 +582,7 @@ where
 
         let req = self
             .client
-            .post("/v1/messages")?
+            .post(Ext::streaming_completion_path(&request_model).as_ref())?
             .body(body)
             .map_err(http_client::Error::Protocol)?;
 

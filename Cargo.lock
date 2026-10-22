@@ -10252,8 +10252,12 @@ version = "0.42.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "google-cloud-aiplatform-v1",
  "google-cloud-auth",
+ "google-cloud-gax",
+ "http 1.4.2",
+ "reqwest 0.13.4",
  "rig-agent",
  "rig-core",
  "schemars 1.2.1",

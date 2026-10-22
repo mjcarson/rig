@@ -53,6 +53,7 @@ default-members = [
     "crates/rig-bedrock",
     "crates/rig-candle",
     "crates/rig-gemini-grpc",
+    "crates/rig-vertexai",
 ]
 exclude = [
     "archived",
@@ -143,6 +144,7 @@ google-cloud-auth = "1"
 google-cloud-aiplatform-v1 = { version = "1.7", default-features = false, features = [
     "prediction-service",
 ] }
+google-cloud-gax = "1"
 http = "1"
 # 0.8.2: `Recording::export_async` (cassette harness).
 httpmock = "0.8.2"

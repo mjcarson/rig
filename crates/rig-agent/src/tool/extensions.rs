@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::tool::ToolExecutionError;
+use rig_core::message::{ProviderCallId, ToolCallId};
 use rig_core::wasm_compat::{WasmCompatSend, WasmCompatSync};
 
 type AnyMap = HashMap<TypeId, Box<dyn AnyClone>, BuildHasherDefault<IdHasher>>;
@@ -275,6 +276,23 @@ impl std::fmt::Debug for ToolContext {
             .field("result_types", &self.result.type_names())
             .finish()
     }
+}
+
+/// The identifiers of the tool call a dispatch is currently executing.
+///
+/// The agent loop injects one of these into the per-dispatch [`ToolContext`]
+/// just before a tool body runs, so the body can correlate its own side
+/// effects (persistence, telemetry) with the exact call the model issued —
+/// the same identifiers the `ToolCall`/`ToolResult` hooks observe. Absent on
+/// direct typed calls that never went through the agent loop.
+#[derive(Clone, Debug)]
+pub struct CurrentToolCall {
+    /// Rig's always-present correlation handle for this call.
+    pub id: ToolCallId,
+    /// The provider-issued call id, when the provider minted one.
+    pub provider: Option<ProviderCallId>,
+    /// The internal id hooks receive for this call, for event correlation.
+    pub internal_call_id: String,
 }
 
 /// A required typed value was missing from a [`ToolContext`].

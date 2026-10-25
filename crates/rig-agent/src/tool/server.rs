@@ -12,8 +12,8 @@ use crate::tool::ErasedTool;
 use crate::{
     completion::{CompletionError, ToolDefinition},
     tool::{
-        DynamicTool, PortableDynamicTool, RegisteredTool, Tool, ToolContext, ToolDispatch,
-        ToolResult, ToolSet, dispatch_tool,
+        CurrentToolCall, DynamicTool, PortableDynamicTool, RegisteredTool, Tool, ToolContext,
+        ToolDispatch, ToolResult, ToolSet, dispatch_tool,
     },
 };
 use rig_core::vector_store::{
@@ -53,14 +53,18 @@ impl ToolRegistrySnapshot {
     }
 
     /// Dispatch through the exact implementation advertised for this turn.
+    ///
+    /// The agent loop passes the live call's identifiers as `current_call` so
+    /// the dispatched tool body can read them from its per-call context.
     pub(crate) async fn dispatch(
         &self,
         tool_name: &str,
         args: &str,
         context: &ToolContext,
+        current_call: Option<CurrentToolCall>,
     ) -> ToolDispatch {
         let tool = self.tools.get(tool_name).cloned();
-        dispatch_tool(tool_name, args.to_string(), tool, context).await
+        dispatch_tool(tool_name, args.to_string(), tool, context, current_call).await
     }
 }
 
@@ -477,7 +481,7 @@ impl ToolServerHandle {
         let tool = self
             .with_registry(|state| state.toolset.get(tool_name).cloned())
             .await;
-        dispatch_tool(tool_name, args.to_string(), tool, context).await
+        dispatch_tool(tool_name, args.to_string(), tool, context, None).await
     }
 
     /// Retrieve tool definitions, optionally using a prompt to select
@@ -758,7 +762,7 @@ mod tests {
 
         assert_eq!(snapshot.definitions()[0].description, "first schema");
         let dispatch = snapshot
-            .dispatch(ReplacementTool::NAME, "{}", &ToolContext::new())
+            .dispatch(ReplacementTool::NAME, "{}", &ToolContext::new(), None)
             .await;
         assert_eq!(dispatch.result.output().render(), "first implementation");
 
@@ -770,7 +774,7 @@ mod tests {
         let next_snapshot = handle.snapshot_tool_defs(None).await.unwrap();
         assert_eq!(next_snapshot.definitions()[0].description, "second schema");
         let dispatch = next_snapshot
-            .dispatch(ReplacementTool::NAME, "{}", &ToolContext::new())
+            .dispatch(ReplacementTool::NAME, "{}", &ToolContext::new(), None)
             .await;
         assert_eq!(dispatch.result.output().render(), "second implementation");
     }

@@ -1956,6 +1956,51 @@ mod tests {
         assert_eq!(probe.observed().as_deref(), Some("session:abc-123"));
     }
 
+    /// The agent loop injects the live call's identifiers ([`CurrentToolCall`])
+    /// into every dispatch's context — through `run_single_tool`, the choke
+    /// point the blocking and streaming drivers share — so a tool body can
+    /// correlate its side effects with the call the hooks observe. Two rounds
+    /// assert per-call injection (distinct ids), and a direct typed call
+    /// (which never passes the loop) observes nothing.
+    #[tokio::test]
+    async fn current_tool_call_reaches_tool_through_agent_loop() {
+        use crate::test_utils::MockCallIdProbeTool;
+
+        let model = MockCompletionModel::new([
+            MockTurn::tool_call("probe-1", "call_id_probe", json!({})),
+            MockTurn::tool_call("probe-2", "call_id_probe", json!({})),
+            MockTurn::text("done"),
+        ]);
+        let probe = MockCallIdProbeTool::default();
+        let agent = AgentBuilder::new(model).tool(probe.clone()).build();
+
+        let out = agent
+            .prompt("use the tool twice")
+            .max_turns(5)
+            .await
+            .expect("run succeeds");
+
+        assert_eq!(out, "done");
+        let observed = probe.observations();
+        assert_eq!(observed.len(), 2);
+        // the wire id drives both rig's handle and the provider identity
+        assert!(observed[0].starts_with("probe-1|probe-1|"));
+        assert!(observed[1].starts_with("probe-2|probe-2|"));
+        // every dispatch carries a non-empty internal id for hook correlation
+        for entry in &observed {
+            let internal = entry.rsplit('|').next().expect("three segments");
+            assert!(!internal.is_empty(), "internal_call_id must be injected");
+        }
+
+        // a direct typed call bypasses the loop and observes no injected call
+        let direct = MockCallIdProbeTool::default();
+        let out = direct
+            .call(&mut ToolContext::new(), json!({}))
+            .await
+            .expect("direct call succeeds");
+        assert_eq!(out, "no-call");
+    }
+
     /// Context values persist for the whole run, across *multiple* tool-call rounds
     /// (the headline value prop). The model calls the probe in two consecutive
     /// rounds; both must observe the same injected value, not just the first.

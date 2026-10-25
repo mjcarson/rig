@@ -148,7 +148,7 @@ compile_error!(
 pub mod rmcp;
 pub mod server;
 
-pub use extensions::{MissingToolContext, ToolContext};
+pub use extensions::{CurrentToolCall, MissingToolContext, ToolContext};
 pub use rig_core::tool::{
     IntoToolOutput, PortableDynamicTool, ToolErrorKind, ToolExecutionError, ToolOutput, ToolResult,
 };
@@ -601,14 +601,22 @@ impl ToolDispatch {
 /// Every surface enters here with its caller-owned context. The helper clones
 /// inbound values exactly once, clears prior result metadata, and returns the
 /// per-dispatch context so callers can expose its metadata without publishing
-/// mutations the tool made to its local inbound snapshot.
+/// mutations the tool made to its local inbound snapshot. The agent loop
+/// passes the live call's identifiers as `current_call`, seeded into the
+/// per-dispatch snapshot (never the caller's context) so the tool body can
+/// correlate itself with the call the hooks observe; surfaces outside a model
+/// turn pass `None`.
 pub(crate) async fn dispatch_tool(
     name: &str,
     args: String,
     tool: Option<RegisteredTool>,
     context: &ToolContext,
+    current_call: Option<CurrentToolCall>,
 ) -> ToolDispatch {
     let mut dispatch_context = context.for_dispatch();
+    if let Some(call) = current_call {
+        dispatch_context.insert(call);
+    }
     let result = match tool {
         Some(tool) => {
             tracing::debug!(target: "rig", tool_name = name, "calling tool with args:\n{args}");
@@ -758,7 +766,7 @@ impl ToolSet {
     ) -> ToolResult {
         context.clear_dispatch_result();
         let tool = self.get(name).cloned();
-        let dispatch = dispatch_tool(name, args.into(), tool, context).await;
+        let dispatch = dispatch_tool(name, args.into(), tool, context, None).await;
         dispatch.publish_to(context)
     }
 

@@ -131,6 +131,66 @@ impl Tool for MockContextProbeTool {
     }
 }
 
+/// A mock tool that records the [`CurrentToolCall`](crate::tool::CurrentToolCall)
+/// observed in its per-call [`ToolContext`], so tests can assert the agent loop
+/// injects the live call's identifiers into tool execution.
+///
+/// Each call records `"<id>|<provider-or-none>|<internal_call_id>"` (or
+/// `"no-call"` when the context carries no injected call).
+#[derive(Clone, Default)]
+pub struct MockCallIdProbeTool {
+    /// One entry per call, in call order.
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl MockCallIdProbeTool {
+    /// Everything the tool observed, one entry per call in call order.
+    pub fn observations(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl Tool for MockCallIdProbeTool {
+    const NAME: &'static str = "call_id_probe";
+    type Error = ToolExecutionError;
+    type Args = serde_json::Value;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "Records the CurrentToolCall observed in its call context".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({"type": "object", "properties": {}})
+    }
+
+    async fn call(
+        &self,
+        context: &mut ToolContext,
+        _args: Self::Args,
+    ) -> Result<Self::Output, ToolExecutionError> {
+        let observed = match context.get::<crate::tool::CurrentToolCall>() {
+            Some(call) => format!(
+                "{}|{}|{}",
+                call.id.as_str(),
+                call.provider
+                    .as_ref()
+                    .map_or("none", |provider| provider.call_id.as_str()),
+                call.internal_call_id
+            ),
+            None => "no-call".to_string(),
+        };
+        self.seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(observed.clone());
+        Ok(observed)
+    }
+}
+
 /// A mock tool that subtracts `y` from `x`.
 #[derive(Deserialize, Serialize)]
 pub struct MockSubtractTool;

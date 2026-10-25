@@ -161,8 +161,8 @@ pub mod tool {
     #[cfg(feature = "agent")]
     #[cfg_attr(docsrs, doc(cfg(feature = "agent")))]
     pub use rig_agent::tool::{
-        DynamicTool, MissingToolContext, Tool, ToolContext, ToolEmbedding, ToolSet, server,
-        tool_definition,
+        CurrentToolCall, DynamicTool, MissingToolContext, Tool, ToolContext, ToolEmbedding,
+        ToolSet, server, tool_definition,
     };
 
     /// The complete portable `rig-core` tool surface, under one explicit path.

@@ -741,10 +741,21 @@ pub(crate) async fn run_single_tool(
         None => {
             let mut effective_tool_call = tool_call.clone();
             effective_tool_call.function.arguments = effective_args;
+            // Expose the live call's identifiers to the tool body through its
+            // per-dispatch context — the same identifiers the hooks observe —
+            // seeded by the dispatch boundary into the per-call snapshot so
+            // the run-wide context is never mutated.
+            let current_call = crate::tool::CurrentToolCall {
+                id: tool_call.id.clone(),
+                provider: tool_call.provider.clone(),
+                internal_call_id: internal_call_id.to_owned(),
+            };
             let ToolDispatch {
                 result: exec,
                 context: dispatch_context,
-            } = tool_snapshot.dispatch(tool_name, &args, tool_context).await;
+            } = tool_snapshot
+                .dispatch(tool_name, &args, tool_context, Some(current_call))
+                .await;
             (
                 exec,
                 ToolExecution::Executed(Box::new(effective_tool_call)),

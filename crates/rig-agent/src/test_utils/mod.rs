@@ -15,9 +15,9 @@ pub use model_conformance::{
 };
 pub use rig_core::test_utils::*;
 pub use tools::{
-    BarrierMockToolIndex, MockAddTool, MockBarrierTool, MockContextProbeTool, MockControlledTool,
-    MockDeniedTool, MockExampleTool, MockFailingTool, MockFailure, MockHandledFailureTool,
-    MockImageGeneratorTool, MockImageOutputTool, MockMetadataTool, MockObjectOutputTool,
-    MockOperationArgs, MockRequestId, MockStringOutputTool, MockSubtractTool, MockToolError,
-    MockToolIndex, SessionId, mock_math_toolset,
+    BarrierMockToolIndex, MockAddTool, MockBarrierTool, MockCallIdProbeTool, MockContextProbeTool,
+    MockControlledTool, MockDeniedTool, MockExampleTool, MockFailingTool, MockFailure,
+    MockHandledFailureTool, MockImageGeneratorTool, MockImageOutputTool, MockMetadataTool,
+    MockObjectOutputTool, MockOperationArgs, MockRequestId, MockStringOutputTool, MockSubtractTool,
+    MockToolError, MockToolIndex, SessionId, mock_math_toolset,
 };

@@ -462,6 +462,23 @@ forward_into_tool_builder! {
         timeout: impl Into<Option<std::time::Duration>>
     );
 
+    /// Add an array of MCP tools (from `rmcp`) sharing one client, each
+    /// registered under its caller-chosen model-visible name with the same
+    /// per-call timeout (see issue #1914).
+    ///
+    /// Each `(name, tool)` pair advertises as `name` while the MCP wire call
+    /// keeps the definition's own name. Pass a
+    /// [`Duration`](std::time::Duration) to bound calls, or `None` to disable
+    /// the timeout (unbounded).
+    /// Transitions the builder to the `WithBuilderTools` state.
+    #[cfg(all(feature = "rmcp", not(target_family = "wasm")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rmcp")))]
+    rmcp_tools_named_with_timeout(
+        tools: Vec<(String, rmcp::model::Tool)>,
+        client: rmcp::service::ServerSink,
+        timeout: impl Into<Option<std::time::Duration>>
+    );
+
     /// Configure tools retrieved from a vector index for each prompt.
     ///
     /// Transitions the builder to the `WithBuilderTools` state.
@@ -543,6 +560,27 @@ impl AgentBuilder<WithBuilderTools> {
         timeout: impl Into<Option<std::time::Duration>>,
     ) -> Self {
         self.map_server(|server| server.rmcp_tools_with_timeout(tools, client, timeout))
+    }
+
+    /// Add an array of MCP tools (from `rmcp`) sharing one client, each
+    /// registered under its caller-chosen model-visible name with the same
+    /// per-call timeout (see issue #1914).
+    ///
+    /// Each `(name, tool)` pair advertises as `name` (e.g. a `server__tool`
+    /// prefix disambiguating same-named tools from different MCP servers)
+    /// while the MCP wire call keeps the definition's own name, which is the
+    /// only name the server accepts. Pass a
+    /// [`Duration`](std::time::Duration) to bound calls, or `None` to disable
+    /// the timeout (unbounded).
+    #[cfg(all(feature = "rmcp", not(target_family = "wasm")))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "rmcp")))]
+    pub fn rmcp_tools_named_with_timeout(
+        self,
+        tools: Vec<(String, rmcp::model::Tool)>,
+        client: rmcp::service::ServerSink,
+        timeout: impl Into<Option<std::time::Duration>>,
+    ) -> Self {
+        self.map_server(|server| server.rmcp_tools_named_with_timeout(tools, client, timeout))
     }
 
     /// Configure tools retrieved from a vector index for each prompt.

@@ -113,6 +113,12 @@ pub(crate) struct McpTool {
     /// On elapse RMCP sends a cancellation notification so both peers can
     /// release request-scoped resources.
     timeout: Option<Duration>,
+    /// Model-visible name override. When `Some`, the agent registers and
+    /// advertises the tool under this name (e.g. a `server__tool` prefix that
+    /// disambiguates same-named tools from different MCP servers) while
+    /// [`execute_mcp`](Self::execute_mcp) keeps calling the server with the
+    /// definition's own name, which is the only name the server accepts.
+    name_override: Option<String>,
 }
 
 impl McpTool {
@@ -128,6 +134,7 @@ impl McpTool {
             definition,
             client,
             timeout: Some(DEFAULT_MCP_TOOL_TIMEOUT),
+            name_override: None,
         }
     }
 
@@ -140,6 +147,16 @@ impl McpTool {
     /// elapses.
     pub(crate) fn with_timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.timeout = timeout.into();
+        self
+    }
+
+    /// Set (or clear) the model-visible name, consuming and returning the tool.
+    ///
+    /// Pass a name to register the tool under it (the MCP wire call keeps the
+    /// definition's own name), or `None` to advertise the definition's name
+    /// unchanged.
+    pub(crate) fn with_name(mut self, name: impl Into<Option<String>>) -> Self {
+        self.name_override = name.into();
         self
     }
 
@@ -291,22 +308,28 @@ impl McpTool {
         args: String,
         meta: Option<rmcp::model::Meta>,
     ) -> WasmBoxedFuture<'_, Result<CallToolResult, ToolExecutionError>> {
-        let name = self.definition.name.clone();
+        // the wire call must use the definition's own name (the only name the
+        // server accepts), while diagnostics the model can see must use the
+        // advertised name — with a name override those differ, and the model
+        // can only act on the name it was advertised
+        let wire_name = self.definition.name.clone();
+        let display_name = self.name();
 
         Box::pin(async move {
             // Validate the JSON arguments before contacting the server: malformed
             // JSON must surface as an InvalidArgs failure, not a silent no-arg call.
             let arguments = parse_mcp_arguments(&args).map_err(|error| {
                 ToolExecutionError::invalid_args(format!(
-                    "MCP tool '{name}' received invalid arguments: {error}"
+                    "MCP tool '{display_name}' received invalid arguments: {error}"
                 ))
                 .with_source(error)
             })?;
             let mut request = arguments
                 .map(|arguments| {
-                    rmcp::model::CallToolRequestParams::new(name.clone()).with_arguments(arguments)
+                    rmcp::model::CallToolRequestParams::new(wire_name.clone())
+                        .with_arguments(arguments)
                 })
-                .unwrap_or_else(|| rmcp::model::CallToolRequestParams::new(name));
+                .unwrap_or_else(|| rmcp::model::CallToolRequestParams::new(wire_name));
             request.meta = meta;
 
             match call_mcp_tool(&self.client, request, self.timeout).await {
@@ -318,15 +341,13 @@ impl McpTool {
                 ) => {
                     let timeout = self.timeout.unwrap_or(elapsed_timeout);
                     Err(ToolExecutionError::timeout(format!(
-                        "MCP tool '{}' timed out after {timeout:?}",
-                        self.definition.name
+                        "MCP tool '{display_name}' timed out after {timeout:?}"
                     ))
                     .with_source(error))
                 }
                 // A transport/service error before the tool produced a result.
                 Err(error) => Err(ToolExecutionError::provider(format!(
-                    "MCP tool '{}' request failed: {error}",
-                    self.definition.name
+                    "MCP tool '{display_name}' request failed: {error}"
                 ))
                 .with_source(error)),
             }
@@ -460,7 +481,12 @@ fn preserve_mcp_result(context: &mut ToolContext, result: &CallToolResult) {
 
 impl ErasedTool for McpTool {
     fn name(&self) -> String {
-        self.definition.name.to_string()
+        // advertise the override when one is set; the MCP wire call in
+        // execute_mcp always uses the definition's own name regardless
+        match &self.name_override {
+            Some(name) => name.clone(),
+            None => self.definition.name.to_string(),
+        }
     }
 
     fn description(&self) -> String {
@@ -499,7 +525,7 @@ impl ErasedTool for McpTool {
                         ToolResult::failed(
                             ToolExecutionError::other(format!(
                                 "MCP tool '{}' reported an execution error",
-                                self.definition.name
+                                self.name()
                             ))
                             .with_model_output(output),
                         )
@@ -1981,6 +2007,74 @@ mod migrated_tests {
         assert_eq!(
             result.error().expect("disconnected tool must fail").kind(),
             crate::tool::ToolErrorKind::NotFound
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn named_registration_dispatches_by_display_name_and_calls_raw_name() {
+        let tool = make_tool("search_docs", "Search the docs");
+        let server = DynamicToolServer::new(vec![tool.clone()]);
+        let (c2s, sfc) = tokio::io::duplex(8192);
+        let (s2c, cfs) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            let running = server.serve((sfc, s2c)).await.unwrap();
+            running.waiting().await.unwrap();
+        });
+        let client = ClientInfo::default().serve((cfs, c2s)).await.unwrap();
+        let handle = ToolServer::new()
+            .rmcp_tools_named_with_timeout(
+                vec![("intel__search_docs".to_string(), tool)],
+                client.peer().clone(),
+                Some(Duration::from_secs(1)),
+            )
+            .run();
+
+        // the agent advertises the tool under the display name only
+        let defs = handle.get_tool_defs(None).await.unwrap();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "intel__search_docs");
+        assert_eq!(defs[0].description, "Search the docs");
+
+        // dispatch by the display name round-trips, and the server-side echo
+        // proves the wire call carried the definition's own name
+        let result = handle
+            .execute("intel__search_docs", "{}", &mut crate::tool::ToolContext::new())
+            .await;
+        assert!(result.is_success());
+        assert_eq!(
+            result.output(),
+            &ToolOutput::one(rig_core::message::ToolResultContent::text(
+                "called search_docs"
+            ))
+        );
+
+        // the definition's own name is not registered under a named registration
+        let missing = handle
+            .execute("search_docs", "{}", &mut crate::tool::ToolContext::new())
+            .await;
+        assert_eq!(
+            missing.error().expect("raw name must not dispatch").kind(),
+            crate::tool::ToolErrorKind::NotFound
+        );
+
+        // model-visible diagnostics name the advertised tool, not the wire name:
+        // the model was never shown 'search_docs', so an error naming it would
+        // point at a tool the model cannot call
+        let invalid = handle
+            .execute(
+                "intel__search_docs",
+                "{not json",
+                &mut crate::tool::ToolContext::new(),
+            )
+            .await;
+        assert_eq!(
+            invalid.error().expect("malformed args must fail").kind(),
+            crate::tool::ToolErrorKind::InvalidArgs
+        );
+        assert!(
+            invalid.output().render().contains("intel__search_docs"),
+            "the model-visible error must use the advertised name"
         );
         task.abort();
     }

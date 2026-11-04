@@ -15,7 +15,7 @@ use rig_core::http_client::{
 use rig_core::wasm_compat::WasmCompatSend;
 use tokio::sync::OnceCell;
 
-use crate::client::build_credentials;
+use crate::common::build_credentials;
 
 /// Where the backend gets its Google Cloud credentials from
 #[derive(Clone, Default)]

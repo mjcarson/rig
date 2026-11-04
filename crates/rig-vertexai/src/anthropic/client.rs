@@ -17,7 +17,7 @@ use rig_core::providers::anthropic::completion::{
 };
 
 use super::http::{CredentialSource, VertexHttpClient};
-use crate::client::{DEFAULT_LOCATION, VertexAiClientError, vertex_host};
+use crate::common::{DEFAULT_LOCATION, VertexAiClientError, vertex_host};
 
 /// The Anthropic API version Vertex AI expects in every request body
 ///

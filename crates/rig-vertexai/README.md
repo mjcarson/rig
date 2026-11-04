@@ -19,6 +19,11 @@ You can also run `cargo add rig-vertexai rig-core` to add the most recent versio
 
 See the [`/examples`](./examples) folder for usage examples.
 
+The Gemini client sits behind the default-on `gemini` feature, which pulls in
+the generated `google-cloud-aiplatform-v1` crate. For Claude only, disable
+default features (`rig-vertexai = { version = "...", default-features = false }`,
+or the `rig` facade's `vertexai-anthropic` feature instead of `vertexai`).
+
 ## Setup
 
 Make sure to have Google Cloud credentials configured. You can use Application Default Credentials (ADC) by running:

@@ -261,5 +261,5 @@ companion_modules! {
     sqlite = rig_sqlite ["sqlite"];
     surrealdb = rig_surrealdb ["surrealdb"];
     vectorize = rig_vectorize ["vectorize"];
-    vertexai = rig_vertexai ["vertexai"];
+    vertexai = rig_vertexai ["vertexai", "vertexai-anthropic"];
 }
